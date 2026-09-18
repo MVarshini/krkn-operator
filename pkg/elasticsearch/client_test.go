@@ -38,7 +38,7 @@ func TestQueryTelemetry(t *testing.T) {
         ]
       },
       "aggregations": {
-        "by_job_status": {
+        "job_status": {
           "buckets": [
             {"key": 1, "key_as_string": "true", "doc_count": 10},
             {"key": 0, "key_as_string": "false", "doc_count": 3}
@@ -130,7 +130,7 @@ func TestQueryTelemetry(t *testing.T) {
 				Index: tt.index,
 			}
 
-			docs, stats, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "")
+			docs, stats, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "", nil)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")
@@ -161,7 +161,7 @@ func TestQueryTelemetryRejectsCredentialsOverHTTP(t *testing.T) {
 	defer srv.Close()
 
 	conn := ConnectionParams{Host: srv.URL, Index: "telemetry", Username: "elastic", Password: "secret"}
-	_, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "")
+	_, _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "", nil)
 	if err == nil {
 		t.Fatal("expected error for credentials over plaintext HTTP, got nil")
 	}
@@ -247,7 +247,7 @@ func TestQueryTelemetryUsesInjectedDoer(t *testing.T) {
 	// A host that would never resolve proves the injected Doer is used instead
 	// of a real network client.
 	conn := ConnectionParams{Host: "https://unreachable.invalid", Port: 9200, Index: "telemetry"}
-	docs, _, err := c.QueryTelemetry(context.Background(), conn, 10, "", "")
+	docs, _, _, err := c.QueryTelemetry(context.Background(), conn, 10, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestQueryTelemetryRejectsOversizedResponse(t *testing.T) {
 	defer srv.Close()
 
 	conn := ConnectionParams{Host: srv.URL, Index: "telemetry"}
-	_, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "")
+	_, _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "", nil)
 	if err == nil {
 		t.Fatal("expected an error for an oversized response, got nil")
 	}
@@ -364,7 +364,7 @@ func TestQueryTelemetrySortsNewestFirst(t *testing.T) {
 	defer srv.Close()
 
 	conn := ConnectionParams{Host: srv.URL, Index: "telemetry"}
-	if _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", ""); err != nil {
+	if _, _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -422,7 +422,7 @@ func TestQueryTelemetryDateRange(t *testing.T) {
 			defer srv.Close()
 
 			conn := ConnectionParams{Host: srv.URL, Index: "telemetry"}
-			if _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, tt.startDate, tt.endDate); err != nil {
+			if _, _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, tt.startDate, tt.endDate, nil); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
@@ -443,6 +443,72 @@ func TestQueryTelemetryDateRange(t *testing.T) {
 				t.Errorf("unexpected %q bound present: %v", otherKey, rng[otherKey])
 			}
 		})
+	}
+}
+
+func TestQueryTelemetryFiltersAndFacets(t *testing.T) {
+	var captured map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&captured)
+		_, _ = w.Write([]byte(`{"hits":{"hits":[]},"aggregations":{
+			"job_status":{"buckets":[{"key":1,"key_as_string":"true","doc_count":4},{"key":0,"key_as_string":"false","doc_count":1}]},
+			"cloud_type":{"buckets":[{"key":"rosa","doc_count":3},{"key":"self-managed","doc_count":2}]}
+		}}`))
+	}))
+	defer srv.Close()
+
+	conn := ConnectionParams{Host: srv.URL, Index: "telemetry"}
+	filters := map[string][]string{
+		"cloud_type": {"rosa"},
+		"job_status": {"true"},
+	}
+	_, stats, facets, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "", filters)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// One terms aggregation is requested per facet category.
+	aggs := captured["aggs"].(map[string]any)
+	for _, key := range []string{"scenario_type", "job_status", "cloud_infrastructure", "cloud_type", "major_version", "network_plugins"} {
+		if _, ok := aggs[key]; !ok {
+			t.Errorf("missing aggregation for facet %q", key)
+		}
+	}
+
+	// Selected filters become terms clauses: cloud_type on its keyword field
+	// (string value), job_status on the boolean field (coerced to real bool).
+	clauses := captured["query"].(map[string]any)["bool"].(map[string]any)["filter"].([]any)
+	var cloudTerms, jobTerms []any
+	for _, c := range clauses {
+		terms, ok := c.(map[string]any)["terms"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if v, ok := terms["cloud_type.keyword"].([]any); ok {
+			cloudTerms = v
+		}
+		if v, ok := terms["job_status"].([]any); ok {
+			jobTerms = v
+		}
+	}
+	if len(cloudTerms) != 1 || cloudTerms[0] != "rosa" {
+		t.Errorf("got cloud_type terms %v, want [rosa]", cloudTerms)
+	}
+	if len(jobTerms) != 1 || jobTerms[0] != true {
+		t.Errorf("got job_status terms %v, want [true]", jobTerms)
+	}
+
+	// Stats still derive from the job_status aggregation.
+	if stats.Pass != 4 || stats.Fail != 1 {
+		t.Errorf("got stats %+v, want Pass=4 Fail=1", stats)
+	}
+
+	// Facets carry the aggregation buckets for the UI value dropdowns.
+	if ct := facets["cloud_type"]; len(ct) != 2 || ct[0].Value != "rosa" || ct[0].Count != 3 {
+		t.Errorf("got cloud_type facet %+v, want [{rosa 3} {self-managed 2}]", ct)
+	}
+	if js := facets["job_status"]; len(js) != 2 || js[0].Value != "true" {
+		t.Errorf("got job_status facet %+v, want true/false values", js)
 	}
 }
 

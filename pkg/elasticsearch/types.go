@@ -124,6 +124,11 @@ type QueryTelemetryRequest struct {
 	// values fall back to a default trailing window in the query client.
 	StartDate string `json:"startDate,omitempty"`
 	EndDate   string `json:"endDate,omitempty"`
+	// Filters narrows the search to documents matching selected facet values,
+	// keyed by facet category (one of the keys in facetFields). The values for a
+	// category are OR-ed together; different categories are AND-ed. Unknown
+	// category keys are rejected by ValidateQueryRequest.
+	Filters map[string][]string `json:"filters,omitempty"`
 }
 
 // ClusterMetadata holds the run-level cluster and infrastructure details
@@ -227,6 +232,14 @@ type TelemetryStats struct {
 	PassPercent float64 `json:"pass_percent"` // 0-100, rounded to 2 decimals; 0 when no runs
 }
 
+// FacetOption is one selectable value for a filter category, with the number of
+// documents in the matched window that carry it. It populates the value
+// multi-select in the UI.
+type FacetOption struct {
+	Value string `json:"value"`
+	Count int    `json:"count"`
+}
+
 // QueryTelemetryResponse wraps the telemetry documents returned to the client.
 type QueryTelemetryResponse struct {
 	Documents []TelemetryDocument `json:"documents"`
@@ -234,6 +247,11 @@ type QueryTelemetryResponse struct {
 	// Stats summarizes pass/fail across the whole matched window, so Stats.Pass +
 	// Stats.Fail can exceed Total (which counts only the returned documents page).
 	Stats TelemetryStats `json:"stats"`
+	// Facets maps each filter category (a key from facetFields) to the available
+	// values in the matched window, derived from a terms aggregation per category.
+	// The UI uses it to populate the value multi-select. Because filters are
+	// applied in the query, facets narrow as filters are selected.
+	Facets map[string][]FacetOption `json:"facets,omitempty"`
 }
 
 // ValidateQueryRequest validates a QueryTelemetryRequest and normalizes the
@@ -262,6 +280,24 @@ func ValidateQueryRequest(req *QueryTelemetryRequest) error {
 	}
 	if req.EndDate != "" && req.EndDate > time.Now().UTC().Format(dateLayout) {
 		return fmt.Errorf("endDate must not be in the future")
+	}
+	if err := validateFilters(req.Filters); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateFilters rejects filter categories that are not known facet fields.
+// Empty value slices are dropped from the map so they never reach the query
+// builder as no-op clauses.
+func validateFilters(filters map[string][]string) error {
+	for key, values := range filters {
+		if !isFacetField(key) {
+			return fmt.Errorf("unknown filter category %q", key)
+		}
+		if len(values) == 0 {
+			delete(filters, key)
+		}
 	}
 	return nil
 }

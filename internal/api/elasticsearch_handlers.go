@@ -499,7 +499,7 @@ func (h *Handler) QueryElasticsearchTelemetry(w http.ResponseWriter, r *http.Req
 
 	conn := buildConnectionParams(secret)
 
-	docs, stats, err := h.esClient.QueryTelemetry(ctx, conn, req.Size, req.StartDate, req.EndDate)
+	docs, stats, facets, err := h.esClient.QueryTelemetry(ctx, conn, req.Size, req.StartDate, req.EndDate, req.Filters)
 	if err != nil {
 		// Log bounded upstream diagnostics server-side for troubleshooting, but
 		// never return raw upstream bodies or internal client errors to the
@@ -524,6 +524,7 @@ func (h *Handler) QueryElasticsearchTelemetry(w http.ResponseWriter, r *http.Req
 		Documents: docs,
 		Total:     len(docs),
 		Stats:     stats,
+		Facets:    facets,
 	})
 }
 

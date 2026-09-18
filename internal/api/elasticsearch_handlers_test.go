@@ -709,7 +709,7 @@ func newEsTestSecretWithHost(name, namespace, host, telemetryIndex string) *core
 func TestQueryElasticsearchTelemetry_Success(t *testing.T) {
 	esServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"hits":{"hits":[{"_source":{"run_uuid":"abc","job_status":true,"scenarios":[{"scenario_type":"pod","start_timestamp":100,"end_timestamp":200,"exit_status":0,"parameters":[{"config":{"namespace":"ns1"}}]}]}}]},"aggregations":{"by_job_status":{"buckets":[{"key":1,"key_as_string":"true","doc_count":1}]}}}`))
+		_, _ = w.Write([]byte(`{"hits":{"hits":[{"_source":{"run_uuid":"abc","job_status":true,"scenarios":[{"scenario_type":"pod","start_timestamp":100,"end_timestamp":200,"exit_status":0,"parameters":[{"config":{"namespace":"ns1"}}]}]}}]},"aggregations":{"job_status":{"buckets":[{"key":1,"key_as_string":"true","doc_count":1}]},"scenario_type":{"buckets":[{"key":"pod","doc_count":1}]}}}`))
 	}))
 	defer esServer.Close()
 
@@ -740,6 +740,83 @@ func TestQueryElasticsearchTelemetry_Success(t *testing.T) {
 	wantStats := elasticsearch.TelemetryStats{Pass: 1, Fail: 0, PassPercent: 100}
 	if resp.Stats != wantStats {
 		t.Errorf("got stats %+v, want %+v", resp.Stats, wantStats)
+	}
+	// Facets from the terms aggregations populate the UI value dropdowns.
+	scenarioFacet := resp.Facets["scenario_type"]
+	if len(scenarioFacet) != 1 || scenarioFacet[0].Value != "pod" || scenarioFacet[0].Count != 1 {
+		t.Errorf("got scenario_type facet %+v, want [{pod 1}]", scenarioFacet)
+	}
+	if jobStatusFacet := resp.Facets["job_status"]; len(jobStatusFacet) != 1 || jobStatusFacet[0].Value != "true" {
+		t.Errorf("got job_status facet %+v, want [{true 1}]", jobStatusFacet)
+	}
+}
+
+func TestQueryElasticsearchTelemetry_Filters(t *testing.T) {
+	var captured map[string]any
+	esServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&captured)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"hits":{"hits":[]},"aggregations":{"job_status":{"buckets":[]}}}`))
+	}))
+	defer esServer.Close()
+
+	secret := newEsTestSecretWithHost("prod-es", "default", esServer.URL, "krkn-telemetry")
+	fakeClient := fakeclient.NewClientBuilder().WithScheme(newEsScheme()).WithObjects(secret).Build()
+	handler := NewTestHandler(fakeClient, fake.NewSimpleClientset(), "default", "localhost:50051")
+
+	body, _ := json.Marshal(elasticsearch.QueryTelemetryRequest{
+		ConfigName: "prod-es",
+		Filters:    map[string][]string{"cloud_type": {"self-managed", "rosa"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, ElasticsearchQueryPath, bytes.NewReader(body))
+	req = req.WithContext(createUserContext("user@example.com"))
+	w := httptest.NewRecorder()
+
+	handler.QueryElasticsearchTelemetry(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// The selected filter must reach Elasticsearch as a terms clause on the
+	// category's keyword field alongside the timestamp range.
+	clauses := captured["query"].(map[string]any)["bool"].(map[string]any)["filter"].([]any)
+	found := false
+	for _, c := range clauses {
+		terms, ok := c.(map[string]any)["terms"].(map[string]any)
+		if !ok {
+			continue
+		}
+		vals, ok := terms["cloud_type.keyword"].([]any)
+		if !ok {
+			continue
+		}
+		found = true
+		if len(vals) != 2 || vals[0] != "self-managed" || vals[1] != "rosa" {
+			t.Errorf("got cloud_type terms %v, want [self-managed rosa]", vals)
+		}
+	}
+	if !found {
+		t.Errorf("no terms clause for cloud_type.keyword in filter %v", clauses)
+	}
+}
+
+func TestQueryElasticsearchTelemetry_RejectsUnknownFilter(t *testing.T) {
+	secret := newEsTestSecretWithHost("prod-es", "default", "https://es.example.com", "krkn-telemetry")
+	fakeClient := fakeclient.NewClientBuilder().WithScheme(newEsScheme()).WithObjects(secret).Build()
+	handler := NewTestHandler(fakeClient, fake.NewSimpleClientset(), "default", "localhost:50051")
+
+	body, _ := json.Marshal(elasticsearch.QueryTelemetryRequest{
+		ConfigName: "prod-es",
+		Filters:    map[string][]string{"not_a_category": {"x"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, ElasticsearchQueryPath, bytes.NewReader(body))
+	req = req.WithContext(createUserContext("user@example.com"))
+	w := httptest.NewRecorder()
+
+	handler.QueryElasticsearchTelemetry(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown filter category, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -840,7 +917,7 @@ func TestQueryElasticsearchTelemetry_RouteAndAuth(t *testing.T) {
 
 	esServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"hits":{"hits":[{"_source":{"run_uuid":"abc","job_status":true,"scenarios":[{"scenario_type":"pod","start_timestamp":100,"end_timestamp":200,"exit_status":0,"parameters":[{"config":{"namespace":"ns1"}}]}]}}]},"aggregations":{"by_job_status":{"buckets":[{"key":1,"key_as_string":"true","doc_count":1}]}}}`))
+		_, _ = w.Write([]byte(`{"hits":{"hits":[{"_source":{"run_uuid":"abc","job_status":true,"scenarios":[{"scenario_type":"pod","start_timestamp":100,"end_timestamp":200,"exit_status":0,"parameters":[{"config":{"namespace":"ns1"}}]}]}}]},"aggregations":{"job_status":{"buckets":[{"key":1,"key_as_string":"true","doc_count":1}]}}}`))
 	}))
 	defer esServer.Close()
 
