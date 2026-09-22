@@ -22,17 +22,29 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 )
 
 func TestQueryTelemetry(t *testing.T) {
+	// The aggregation counts span the whole matched window, so they can (and here
+	// do) exceed the two hits returned in the size-capped page.
 	sampleHits := `{
       "hits": {
+        "total": {"value": 13},
         "hits": [
           {"_source": {"run_uuid": "abc", "job_status": true, "scenarios": [{"scenario_type": "pod_disruption_scenarios", "start_timestamp": 1735689600, "end_timestamp": 1735689900, "exit_status": 0, "parameters": [{"config": {"namespace_pattern": "openshift-kube-apiserver"}}]}, {"scenario_type": "node"}]}},
           {"_source": {"run_uuid": "def", "job_status": false, "scenarios": [{"scenario_type": "pod", "start_timestamp": 1735776000, "end_timestamp": 1735776300, "exit_status": 1, "parameters": [{"config": {"namespace": "default"}}]}]}}
         ]
+      },
+      "aggregations": {
+        "job_status": {
+          "buckets": [
+            {"key": 1, "key_as_string": "true", "doc_count": 10},
+            {"key": 0, "key_as_string": "false", "doc_count": 3}
+          ]
+        }
       }
     }`
 
@@ -43,6 +55,8 @@ func TestQueryTelemetry(t *testing.T) {
 		body       string
 		wantErr    bool
 		wantCount  int
+		wantTotal  int
+		wantStats  TelemetryStats
 		checkFirst func(t *testing.T, d TelemetryDocument)
 	}{
 		{
@@ -51,6 +65,8 @@ func TestQueryTelemetry(t *testing.T) {
 			statusCode: http.StatusOK,
 			body:       sampleHits,
 			wantCount:  2,
+			wantTotal:  13,
+			wantStats:  TelemetryStats{Pass: 10, Fail: 3, PassPercent: 76.92},
 			checkFirst: func(t *testing.T, d TelemetryDocument) {
 				if d.RunUUID != "abc" {
 					t.Errorf("got run_uuid %q, want abc", d.RunUUID)
@@ -71,6 +87,14 @@ func TestQueryTelemetry(t *testing.T) {
 					t.Errorf("got status false, want true")
 				}
 			},
+		},
+		{
+			name:       "no hits and no aggregation yields zero stats",
+			index:      "telemetry",
+			statusCode: http.StatusOK,
+			body:       `{"hits":{"hits":[]}}`,
+			wantCount:  0,
+			wantStats:  TelemetryStats{Pass: 0, Fail: 0, PassPercent: 0},
 		},
 		{
 			name:       "missing index errors before request",
@@ -109,7 +133,7 @@ func TestQueryTelemetry(t *testing.T) {
 				Index: tt.index,
 			}
 
-			docs, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "")
+			docs, total, stats, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, 0, "", "", nil)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("expected error, got nil")
@@ -121,6 +145,12 @@ func TestQueryTelemetry(t *testing.T) {
 			}
 			if len(docs) != tt.wantCount {
 				t.Fatalf("got %d docs, want %d", len(docs), tt.wantCount)
+			}
+			if total != tt.wantTotal {
+				t.Errorf("got total %d, want %d", total, tt.wantTotal)
+			}
+			if stats != tt.wantStats {
+				t.Errorf("got stats %+v, want %+v", stats, tt.wantStats)
 			}
 			if tt.checkFirst != nil && len(docs) > 0 {
 				tt.checkFirst(t, docs[0])
@@ -137,7 +167,7 @@ func TestQueryTelemetryRejectsCredentialsOverHTTP(t *testing.T) {
 	defer srv.Close()
 
 	conn := ConnectionParams{Host: srv.URL, Index: "telemetry", Username: "elastic", Password: "secret"}
-	_, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "")
+	_, _, _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, 0, "", "", nil)
 	if err == nil {
 		t.Fatal("expected error for credentials over plaintext HTTP, got nil")
 	}
@@ -223,7 +253,7 @@ func TestQueryTelemetryUsesInjectedDoer(t *testing.T) {
 	// A host that would never resolve proves the injected Doer is used instead
 	// of a real network client.
 	conn := ConnectionParams{Host: "https://unreachable.invalid", Port: 9200, Index: "telemetry"}
-	docs, err := c.QueryTelemetry(context.Background(), conn, 10, "", "")
+	docs, _, _, _, err := c.QueryTelemetry(context.Background(), conn, 10, 0, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -252,7 +282,7 @@ func TestQueryTelemetryRejectsOversizedResponse(t *testing.T) {
 	defer srv.Close()
 
 	conn := ConnectionParams{Host: srv.URL, Index: "telemetry"}
-	_, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", "")
+	_, _, _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, 0, "", "", nil)
 	if err == nil {
 		t.Fatal("expected an error for an oversized response, got nil")
 	}
@@ -340,7 +370,7 @@ func TestQueryTelemetrySortsNewestFirst(t *testing.T) {
 	defer srv.Close()
 
 	conn := ConnectionParams{Host: srv.URL, Index: "telemetry"}
-	if _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, "", ""); err != nil {
+	if _, _, _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, 0, "", "", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -365,6 +395,38 @@ func TestQueryTelemetrySortsNewestFirst(t *testing.T) {
 	}
 	if _, ok := sort[1].(map[string]any)["_doc"]; !ok {
 		t.Errorf("expected _doc tie-breaker as second sort key, got %v", sort[1])
+	}
+}
+
+// TestQueryTelemetryPagination verifies the size/from page window and the
+// track_total_hits flag are forwarded to Elasticsearch, and that the returned
+// total reflects hits.total.value rather than the returned page length.
+func TestQueryTelemetryPagination(t *testing.T) {
+	var captured map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&captured)
+		_, _ = w.Write([]byte(`{"hits":{"total":{"value":137},"hits":[]}}`))
+	}))
+	defer srv.Close()
+
+	conn := ConnectionParams{Host: srv.URL, Index: "telemetry"}
+	_, total, _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 25, 50, "", "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// JSON numbers decode into float64 through map[string]any.
+	if got := captured["size"]; got != float64(25) {
+		t.Errorf("size = %v, want 25", got)
+	}
+	if got := captured["from"]; got != float64(50) {
+		t.Errorf("from = %v, want 50", got)
+	}
+	if got := captured["track_total_hits"]; got != true {
+		t.Errorf("track_total_hits = %v, want true", got)
+	}
+	if total != 137 {
+		t.Errorf("total = %d, want 137", total)
 	}
 }
 
@@ -398,7 +460,7 @@ func TestQueryTelemetryDateRange(t *testing.T) {
 			defer srv.Close()
 
 			conn := ConnectionParams{Host: srv.URL, Index: "telemetry"}
-			if _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, tt.startDate, tt.endDate); err != nil {
+			if _, _, _, _, err := NewClient().QueryTelemetry(context.Background(), conn, 50, 0, tt.startDate, tt.endDate, nil); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
@@ -419,6 +481,72 @@ func TestQueryTelemetryDateRange(t *testing.T) {
 				t.Errorf("unexpected %q bound present: %v", otherKey, rng[otherKey])
 			}
 		})
+	}
+}
+
+func TestQueryTelemetryFiltersAndFacets(t *testing.T) {
+	var captured map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&captured)
+		_, _ = w.Write([]byte(`{"hits":{"hits":[]},"aggregations":{
+			"job_status":{"buckets":[{"key":1,"key_as_string":"true","doc_count":4},{"key":0,"key_as_string":"false","doc_count":1}]},
+			"cloud_type":{"buckets":[{"key":"rosa","doc_count":3},{"key":"self-managed","doc_count":2}]}
+		}}`))
+	}))
+	defer srv.Close()
+
+	conn := ConnectionParams{Host: srv.URL, Index: "telemetry"}
+	filters := map[string][]string{
+		"cloud_type": {"rosa"},
+		"job_status": {"true"},
+	}
+	_, _, stats, facets, err := NewClient().QueryTelemetry(context.Background(), conn, 50, 0, "", "", filters)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// One terms aggregation is requested per facet category.
+	aggs := captured["aggs"].(map[string]any)
+	for _, key := range []string{"scenario_type", "job_status", "cloud_infrastructure", "cloud_type", "major_version", "network_plugins"} {
+		if _, ok := aggs[key]; !ok {
+			t.Errorf("missing aggregation for facet %q", key)
+		}
+	}
+
+	// Selected filters become terms clauses: cloud_type on its keyword field
+	// (string value), job_status on the boolean field (coerced to real bool).
+	clauses := captured["query"].(map[string]any)["bool"].(map[string]any)["filter"].([]any)
+	var cloudTerms, jobTerms []any
+	for _, c := range clauses {
+		terms, ok := c.(map[string]any)["terms"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if v, ok := terms["cloud_type.keyword"].([]any); ok {
+			cloudTerms = v
+		}
+		if v, ok := terms["job_status"].([]any); ok {
+			jobTerms = v
+		}
+	}
+	if len(cloudTerms) != 1 || cloudTerms[0] != "rosa" {
+		t.Errorf("got cloud_type terms %v, want [rosa]", cloudTerms)
+	}
+	if len(jobTerms) != 1 || jobTerms[0] != true {
+		t.Errorf("got job_status terms %v, want [true]", jobTerms)
+	}
+
+	// Stats still derive from the job_status aggregation.
+	if stats.Pass != 4 || stats.Fail != 1 {
+		t.Errorf("got stats %+v, want Pass=4 Fail=1", stats)
+	}
+
+	// Facets carry the aggregation buckets for the UI value dropdowns.
+	if ct := facets["cloud_type"]; len(ct) != 2 || ct[0].Value != "rosa" || ct[0].Count != 3 {
+		t.Errorf("got cloud_type facet %+v, want [{rosa 3} {self-managed 2}]", ct)
+	}
+	if js := facets["job_status"]; len(js) != 2 || js[0].Value != "true" {
+		t.Errorf("got job_status facet %+v, want true/false values", js)
 	}
 }
 
@@ -497,27 +625,67 @@ func TestRawTelemetrySourceFlatten(t *testing.T) {
 		{
 			name:   "config-style parameters (pod disruption)",
 			source: `{"run_uuid":"abc","job_status":true,"scenarios":[{"scenario_type":"pod","start_timestamp":100,"end_timestamp":200,"exit_status":0,"parameters":[{"config":{"namespace_pattern":"ns1"}}]}]}`,
-			want:   TelemetryDocument{RunUUID: "abc", ScenarioType: "pod", StartTimestamp: 100, EndTimestamp: 200, Namespace: "ns1", Status: true},
+			want: TelemetryDocument{RunUUID: "abc", ScenarioType: "pod", StartTimestamp: 100, EndTimestamp: 200, Namespace: "ns1", Status: true,
+				Scenarios: []ScenarioDetail{{ScenarioType: "pod", StartTimestamp: 100, EndTimestamp: 200, Parameters: json.RawMessage(`[{"config":{"namespace_pattern":"ns1"}}]`)}}},
 		},
 		{
 			name:   "object-style parameters (pvc scenario)",
 			source: `{"run_uuid":"pvc","job_status":true,"scenarios":[{"scenario_type":"pvc_scenarios","start_timestamp":1,"end_timestamp":2,"exit_status":0,"parameters":{"pvc_scenario":{"namespace":"openshift-monitoring","pvc_name":"x"}}}]}`,
-			want:   TelemetryDocument{RunUUID: "pvc", ScenarioType: "pvc_scenarios", StartTimestamp: 1, EndTimestamp: 2, Namespace: "openshift-monitoring", Status: true},
+			want: TelemetryDocument{RunUUID: "pvc", ScenarioType: "pvc_scenarios", StartTimestamp: 1, EndTimestamp: 2, Namespace: "openshift-monitoring", Status: true,
+				Scenarios: []ScenarioDetail{{ScenarioType: "pvc_scenarios", StartTimestamp: 1, EndTimestamp: 2, Parameters: json.RawMessage(`{"pvc_scenario":{"namespace":"openshift-monitoring","pvc_name":"x"}}`)}}},
 		},
 		{
 			name:   "array-nested parameters (time scenario)",
 			source: `{"run_uuid":"time","job_status":true,"scenarios":[{"scenario_type":"time_scenarios","start_timestamp":3,"end_timestamp":4,"exit_status":0,"parameters":{"time_scenarios":[{"namespace":"openshift-etcd","action":"skew_time"}]}}]}`,
-			want:   TelemetryDocument{RunUUID: "time", ScenarioType: "time_scenarios", StartTimestamp: 3, EndTimestamp: 4, Namespace: "openshift-etcd", Status: true},
+			want: TelemetryDocument{RunUUID: "time", ScenarioType: "time_scenarios", StartTimestamp: 3, EndTimestamp: 4, Namespace: "openshift-etcd", Status: true,
+				Scenarios: []ScenarioDetail{{ScenarioType: "time_scenarios", StartTimestamp: 3, EndTimestamp: 4, Parameters: json.RawMessage(`{"time_scenarios":[{"namespace":"openshift-etcd","action":"skew_time"}]}`)}}},
 		},
 		{
 			name:   "non-zero exit status marks failure",
 			source: `{"run_uuid":"def","job_status":true,"scenarios":[{"scenario_type":"node","exit_status":1}]}`,
-			want:   TelemetryDocument{RunUUID: "def", ScenarioType: "node", Status: false},
+			want: TelemetryDocument{RunUUID: "def", ScenarioType: "node", Status: false,
+				Scenarios: []ScenarioDetail{{ScenarioType: "node", ExitStatus: 1}}},
 		},
 		{
 			name:   "no scenarios keeps job status",
 			source: `{"run_uuid":"ghi","job_status":true}`,
 			want:   TelemetryDocument{RunUUID: "ghi", Status: true},
+		},
+		{
+			name:   "affected_pods recovery timings surfaced",
+			source: `{"run_uuid":"rec","job_status":true,"scenarios":[{"scenario_type":"pod_disruption","start_timestamp":5,"end_timestamp":6,"exit_status":0,"parameters":{"scenarios":[{"expected_recovery_time":90,"namespace":"openshift-etcd"}]},"affected_pods":{"recovered":[{"pod_name":"etcd-0","namespace":"openshift-etcd","total_recovery_time":37.5,"pod_readiness_time":37.5,"pod_rescheduling_time":0}]}}]}`,
+			want: TelemetryDocument{RunUUID: "rec", ScenarioType: "pod_disruption", StartTimestamp: 5, EndTimestamp: 6, Namespace: "openshift-etcd", Status: true,
+				Scenarios: []ScenarioDetail{{
+					ScenarioType: "pod_disruption", StartTimestamp: 5, EndTimestamp: 6,
+					Parameters: json.RawMessage(`{"scenarios":[{"expected_recovery_time":90,"namespace":"openshift-etcd"}]}`),
+					AffectedPods: &AffectedPods{Recovered: []RecoveredPod{
+						{PodName: "etcd-0", Namespace: "openshift-etcd", TotalRecoveryTime: 37.5, PodReadinessTime: 37.5, PodReschedulingTime: 0},
+					}},
+				}}},
+		},
+		{
+			name:   "cluster metadata and all scenarios surfaced",
+			source: `{"run_uuid":"m1","job_status":true,"kubernetes_objects_count":{"Pod":701,"ConfigMap":1064},"network_plugins":["OVNKubernetes"],"total_node_count":9,"cloud_infrastructure":"AWS","cloud_type":"self-managed","cluster_version":"4.19.0","major_version":"4.19","build_url":"https://example/1","fips_enabled":false,"tag":"cr","etcd_encryption_enabled":false,"ipsec_enabled":false,"node_summary_infos":[{"count":3,"nodes_type":"master","architecture":"amd64","instance_type":"m5.2xlarge","kernel_version":"5.14.0-570.51.1.el9_6.x86_64","kubelet_version":"v1.33.5","os_version":"Red Hat Enterprise Linux CoreOS 9.6.20250930-0 (Plow)"},{"count":3,"nodes_type":"worker","architecture":"amd64","instance_type":"m5.xlarge","kernel_version":"5.14.0-570.51.1.el9_6.x86_64","kubelet_version":"v1.33.5","os_version":"Red Hat Enterprise Linux CoreOS 9.6.20250930-0 (Plow)"}],"scenarios":[{"scenario_type":"application_outages_scenarios","start_timestamp":10,"end_timestamp":20,"exit_status":0,"parameters":{"application_outage":{"namespace":"openshift-console"}}},{"scenario_type":"pod","start_timestamp":30,"end_timestamp":40,"exit_status":0,"parameters":{"config":{"kill":1},"id":"kill-pods"}}]}`,
+			want: TelemetryDocument{RunUUID: "m1", ScenarioType: "application_outages_scenarios", StartTimestamp: 10, EndTimestamp: 20, Namespace: "openshift-console", Status: true,
+				Metadata: &ClusterMetadata{
+					KubernetesObjectsCount: map[string]int{"Pod": 701, "ConfigMap": 1064},
+					NetworkPlugins:         []string{"OVNKubernetes"},
+					TotalNodeCount:         9,
+					CloudInfrastructure:    "AWS",
+					CloudType:              "self-managed",
+					ClusterVersion:         "4.19.0",
+					MajorVersion:           "4.19",
+					BuildURL:               "https://example/1",
+					Tag:                    "cr",
+					NodeSummaryInfos: []NodeSummaryInfo{
+						{Count: 3, NodesType: "master", Architecture: "amd64", InstanceType: "m5.2xlarge", KernelVersion: "5.14.0-570.51.1.el9_6.x86_64", KubeletVersion: "v1.33.5", OSVersion: "Red Hat Enterprise Linux CoreOS 9.6.20250930-0 (Plow)"},
+						{Count: 3, NodesType: "worker", Architecture: "amd64", InstanceType: "m5.xlarge", KernelVersion: "5.14.0-570.51.1.el9_6.x86_64", KubeletVersion: "v1.33.5", OSVersion: "Red Hat Enterprise Linux CoreOS 9.6.20250930-0 (Plow)"},
+					},
+				},
+				Scenarios: []ScenarioDetail{
+					{ScenarioType: "application_outages_scenarios", StartTimestamp: 10, EndTimestamp: 20, Parameters: json.RawMessage(`{"application_outage":{"namespace":"openshift-console"}}`)},
+					{ScenarioType: "pod", StartTimestamp: 30, EndTimestamp: 40, Parameters: json.RawMessage(`{"config":{"kill":1},"id":"kill-pods"}`)},
+				}},
 		},
 	}
 	for _, tt := range tests {
@@ -527,7 +695,7 @@ func TestRawTelemetrySourceFlatten(t *testing.T) {
 				t.Fatalf("unmarshal error: %v", err)
 			}
 			got := src.flatten()
-			if got != tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("flatten() = %+v, want %+v", got, tt.want)
 			}
 		})
